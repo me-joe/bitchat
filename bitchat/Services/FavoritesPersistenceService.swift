@@ -1,4 +1,5 @@
 import BitLogger
+import BitFoundation
 import Foundation
 import Combine
 
@@ -26,16 +27,15 @@ final class FavoritesPersistenceService: ObservableObject {
 
     private static let storageKey = "chat.bitchat.favorites"
     private static let keychainService = "chat.bitchat.favorites"
+    private let keychain: KeychainManagerProtocol
     
     @Published private(set) var favorites: [Data: FavoriteRelationship] = [:] // Noise pubkey -> relationship
     @Published private(set) var mutualFavorites: Set<Data> = []
     
-    private let userDefaults = UserDefaults.standard
-    private var cancellables = Set<AnyCancellable>()
-    
     static let shared = FavoritesPersistenceService()
-    
-    private init() {
+
+    init(keychain: KeychainManagerProtocol = KeychainManager.makeDefault()) {
+        self.keychain = keychain
         loadFavorites()
         
         // Update mutual favorites when favorites change
@@ -125,7 +125,13 @@ final class FavoritesPersistenceService: ObservableObject {
         peerNostrPublicKey: String? = nil
     ) {
         let existing = favorites[peerNoisePublicKey]
-        let displayName = peerNickname ?? existing?.peerNickname ?? "Unknown"
+        // Callers that can't resolve the live nickname pass the "Unknown"
+        // placeholder (e.g. a notification arriving before the announce);
+        // never let it clobber a real stored nickname.
+        let incoming = peerNickname.flatMap { name in
+            (name.isEmpty || name == "Unknown") ? nil : name
+        }
+        let displayName = incoming ?? existing?.peerNickname ?? "Unknown"
         
         SecureLogger.info("📨 Received favorite notification: \(displayName) \(favorited ? "favorited" : "unfavorited") us", category: .session)
         
@@ -179,123 +185,13 @@ final class FavoritesPersistenceService: ObservableObject {
 
     /// Resolve favorite status by short peer ID (16-hex derived from Noise pubkey)
     /// Falls back to scanning favorites and matching on derived peer ID.
-    func getFavoriteStatus(forPeerID peerID: String) -> FavoriteRelationship? {
+    func getFavoriteStatus(forPeerID peerID: PeerID) -> FavoriteRelationship? {
         // Quick sanity: peerID should be 16 hex chars (8 bytes)
-        guard peerID.count == 16 else { return nil }
-        for (pubkey, rel) in favorites {
-            let derived = PeerIDUtils.derivePeerID(fromPublicKey: pubkey)
-            if derived == peerID { return rel }
+        guard peerID.isShort else { return nil }
+        for (pubkey, rel) in favorites where PeerID(publicKey: pubkey) == peerID {
+            return rel
         }
         return nil
-    }
-    
-    /// Update Nostr public key for a peer
-    func updateNostrPublicKey(for peerNoisePublicKey: Data, nostrPubkey: String) {
-        guard let existing = favorites[peerNoisePublicKey] else { return }
-        
-        let updated = FavoriteRelationship(
-            peerNoisePublicKey: existing.peerNoisePublicKey,
-            peerNostrPublicKey: nostrPubkey,
-            peerNickname: existing.peerNickname,
-            isFavorite: existing.isFavorite,
-            theyFavoritedUs: existing.theyFavoritedUs,
-            favoritedAt: existing.favoritedAt,
-            lastUpdated: Date()
-        )
-        
-        favorites[peerNoisePublicKey] = updated
-        saveFavorites()
-    }
-    
-    /// Update nickname for an existing favorite
-    func updateNickname(for peerNoisePublicKey: Data, newNickname: String) {
-        guard let existing = favorites[peerNoisePublicKey] else { return }
-        
-        // Skip if nickname hasn't changed
-        if existing.peerNickname == newNickname { return }
-        
-        // Updating nickname for favorite
-        
-        let updated = FavoriteRelationship(
-            peerNoisePublicKey: existing.peerNoisePublicKey,
-            peerNostrPublicKey: existing.peerNostrPublicKey,
-            peerNickname: newNickname,
-            isFavorite: existing.isFavorite,
-            theyFavoritedUs: existing.theyFavoritedUs,
-            favoritedAt: existing.favoritedAt,
-            lastUpdated: Date()
-        )
-        
-        favorites[peerNoisePublicKey] = updated
-        saveFavorites()
-        
-        // Notify observers
-        NotificationCenter.default.post(
-            name: .favoriteStatusChanged,
-            object: nil,
-            userInfo: ["peerPublicKey": peerNoisePublicKey]
-        )
-    }
-    
-    /// Update noise public key when peer reconnects with new ID
-    func updateNoisePublicKey(from oldKey: Data, to newKey: Data, peerNickname: String) {
-        guard let existing = favorites[oldKey] else { 
-            SecureLogger.warning("⚠️ Cannot update noise key - no favorite found for \(oldKey.hexEncodedString())", category: .session)
-            return 
-        }
-        
-        // Check if we already have a favorite with the new key
-        if favorites[newKey] != nil {
-            SecureLogger.warning("⚠️ Favorite already exists with new key \(newKey.hexEncodedString()), removing old entry", category: .session)
-            favorites.removeValue(forKey: oldKey)
-            saveFavorites()
-            return
-        }
-        
-        // Updating noise public key
-        
-        // Remove old entry
-        favorites.removeValue(forKey: oldKey)
-        
-        // Add with new key
-        let updated = FavoriteRelationship(
-            peerNoisePublicKey: newKey,
-            peerNostrPublicKey: existing.peerNostrPublicKey,
-            peerNickname: peerNickname,
-            isFavorite: existing.isFavorite,
-            theyFavoritedUs: existing.theyFavoritedUs,
-            favoritedAt: existing.favoritedAt,
-            lastUpdated: Date()
-        )
-        
-        favorites[newKey] = updated
-        saveFavorites()
-        
-        // Notify observers with both old and new keys
-        NotificationCenter.default.post(
-            name: .favoriteStatusChanged,
-            object: nil,
-            userInfo: [
-                "peerPublicKey": newKey,
-                "oldPeerPublicKey": oldKey,
-                "isKeyUpdate": true
-            ]
-        )
-    }
-    
-    /// Get all favorites (including non-mutual)
-    func getAllFavorites() -> [FavoriteRelationship] {
-        favorites.values.filter { $0.isFavorite }
-    }
-    
-    /// Get only mutual favorites
-    func getMutualFavorites() -> [FavoriteRelationship] {
-        favorites.values.filter { $0.isMutual }
-    }
-    
-    /// Get all favorite relationships (including where they favorited us)
-    func getAllRelationships() -> [FavoriteRelationship] {
-        Array(favorites.values)
     }
     
     /// Clear all favorites - used for panic mode
@@ -306,7 +202,7 @@ final class FavoritesPersistenceService: ObservableObject {
         saveFavorites()
         
         // Delete from keychain directly
-        KeychainHelper.delete(
+        keychain.delete(
             key: Self.storageKey,
             service: Self.keychainService
         )
@@ -326,10 +222,11 @@ final class FavoritesPersistenceService: ObservableObject {
             let data = try encoder.encode(relationships)
             
             // Store in keychain for security
-            KeychainHelper.save(
+            keychain.save(
                 key: Self.storageKey,
                 data: data,
-                service: Self.keychainService
+                service: Self.keychainService,
+                accessible: nil
             )
             
             // Successfully saved favorites
@@ -341,7 +238,7 @@ final class FavoritesPersistenceService: ObservableObject {
     private func loadFavorites() {
         // Loading favorites from keychain
         
-        guard let data = KeychainHelper.load(
+        guard let data = keychain.load(
             key: Self.storageKey,
             service: Self.keychainService
         ) else { 

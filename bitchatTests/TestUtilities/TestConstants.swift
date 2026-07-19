@@ -7,16 +7,17 @@
 //
 
 import Foundation
+@testable import bitchat
 
 struct TestConstants {
     static let defaultTimeout: TimeInterval = 5.0
     static let shortTimeout: TimeInterval = 1.0
+    /// For positive waits on work that hops through `Task.detached` or
+    /// background queues: those contend with every parallel test worker for
+    /// the global executor, so a loaded CI runner can exceed
+    /// `defaultTimeout`. `waitUntil` returns as soon as the condition holds,
+    /// so passing runs never pay the longer timeout.
     static let longTimeout: TimeInterval = 10.0
-    
-    static let testPeerID1 = "PEER1234"
-    static let testPeerID2 = "PEER5678"
-    static let testPeerID3 = "PEER9012"
-    static let testPeerID4 = "PEER3456"
     
     static let testNickname1 = "Alice"
     static let testNickname2 = "Bob"
@@ -24,9 +25,5 @@ struct TestConstants {
     static let testNickname4 = "David"
     
     static let testMessage1 = "Hello, World!"
-    static let testMessage2 = "How are you?"
-    static let testMessage3 = "This is a test message"
     static let testLongMessage = String(repeating: "This is a long message. ", count: 100)
-    
-    static let testSignature = Data(repeating: 0xAB, count: 64)
 }

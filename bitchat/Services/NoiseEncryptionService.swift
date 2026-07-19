@@ -83,6 +83,7 @@
 ///
 
 import BitLogger
+import BitFoundation
 import Foundation
 import CryptoKit
 
@@ -115,60 +116,30 @@ enum EncryptionStatus: Equatable {
     var description: String {
         switch self {
         case .none:
-            return L10n.string(
-                "encryption.status.failed",
-                comment: "Status text when encryption failed"
-            )
+            return String(localized: "encryption.status.failed", comment: "Status text when encryption failed")
         case .noHandshake:
-            return L10n.string(
-                "encryption.status.not_encrypted",
-                comment: "Status text when no encryption handshake happened"
-            )
+            return String(localized: "encryption.status.not_encrypted", comment: "Status text when no encryption handshake happened")
         case .noiseHandshaking:
-            return L10n.string(
-                "encryption.status.establishing",
-                comment: "Status text when encryption is being established"
-            )
+            return String(localized: "encryption.status.establishing", comment: "Status text when encryption is being established")
         case .noiseSecured:
-            return L10n.string(
-                "encryption.status.secured",
-                comment: "Status text when encryption is secured but not verified"
-            )
+            return String(localized: "encryption.status.secured", comment: "Status text when encryption is secured but not verified")
         case .noiseVerified:
-            return L10n.string(
-                "encryption.status.verified",
-                comment: "Status text when encryption is verified"
-            )
+            return String(localized: "encryption.status.verified", comment: "Status text when encryption is verified")
         }
     }
 
     var accessibilityDescription: String {
         switch self {
         case .none:
-            return L10n.string(
-                "encryption.accessibility.failed",
-                comment: "Accessibility text when encryption failed"
-            )
+            return String(localized: "encryption.accessibility.failed", comment: "Accessibility text when encryption failed")
         case .noHandshake:
-            return L10n.string(
-                "encryption.accessibility.not_encrypted",
-                comment: "Accessibility text when encryption is not established"
-            )
+            return String(localized: "encryption.accessibility.not_encrypted", comment: "Accessibility text when encryption is not established")
         case .noiseHandshaking:
-            return L10n.string(
-                "encryption.accessibility.establishing",
-                comment: "Accessibility text when encryption is being established"
-            )
+            return String(localized: "encryption.accessibility.establishing", comment: "Accessibility text when encryption is being established")
         case .noiseSecured:
-            return L10n.string(
-                "encryption.accessibility.secured",
-                comment: "Accessibility text when encryption is secured"
-            )
+            return String(localized: "encryption.accessibility.secured", comment: "Accessibility text when encryption is secured")
         case .noiseVerified:
-            return L10n.string(
-                "encryption.accessibility.verified",
-                comment: "Accessibility text when encryption is verified"
-            )
+            return String(localized: "encryption.accessibility.verified", comment: "Accessibility text when encryption is verified")
         }
     }
 }
@@ -182,18 +153,18 @@ enum EncryptionStatus: Equatable {
 final class NoiseEncryptionService {
     // Static identity key (persistent across sessions)
     private let staticIdentityKey: Curve25519.KeyAgreement.PrivateKey
-    public let staticIdentityPublicKey: Curve25519.KeyAgreement.PublicKey
+    let staticIdentityPublicKey: Curve25519.KeyAgreement.PublicKey
     
     // Ed25519 signing key (persistent across sessions)
     private let signingKey: Curve25519.Signing.PrivateKey
-    public let signingPublicKey: Curve25519.Signing.PublicKey
+    let signingPublicKey: Curve25519.Signing.PublicKey
     
     // Session manager
     private let sessionManager: NoiseSessionManager
     
     // Peer fingerprints (SHA256 hash of static public key)
-    private var peerFingerprints: [String: String] = [:] // peerID -> fingerprint
-    private var fingerprintToPeerID: [String: String] = [:] // fingerprint -> peerID
+    private var peerFingerprints: [PeerID: String] = [:]
+    private var fingerprintToPeerID: [String: PeerID] = [:]
     
     // Thread safety
     private let serviceQueue = DispatchQueue(label: "chat.bitchat.noise.service", attributes: .concurrent)
@@ -201,24 +172,28 @@ final class NoiseEncryptionService {
     // Security components
     private let rateLimiter = NoiseRateLimiter()
     private let keychain: KeychainManagerProtocol
+
+    // One-time prekeys for forward-secret courier sealing (lazy generation
+    // inside the store; the batch is minted on first bundle build).
+    private let localPrekeys: LocalPrekeyStore
     
     // Session maintenance
     private var rekeyTimer: Timer?
     private let rekeyCheckInterval: TimeInterval = 60.0 // Check every minute
     
     // Callbacks
-    private var onPeerAuthenticatedHandlers: [((String, String) -> Void)] = [] // Array of handlers for peer authentication
-    var onHandshakeRequired: ((String) -> Void)? // peerID needs handshake
+    private var onPeerAuthenticatedHandlers: [((PeerID, String) -> Void)] = [] // Array of handlers for peer authentication
+    var onHandshakeRequired: ((PeerID) -> Void)? // peerID needs handshake
     
     // Add a handler for peer authentication
-    func addOnPeerAuthenticatedHandler(_ handler: @escaping (String, String) -> Void) {
+    func addOnPeerAuthenticatedHandler(_ handler: @escaping (PeerID, String) -> Void) {
         serviceQueue.async(flags: .barrier) { [weak self] in
             self?.onPeerAuthenticatedHandlers.append(handler)
         }
     }
     
     // Legacy support - setting this will add to the handlers array
-    var onPeerAuthenticated: ((String, String) -> Void)? {
+    var onPeerAuthenticated: ((PeerID, String) -> Void)? {
         get { nil } // Always return nil for backward compatibility
         set {
             if let handler = newValue {
@@ -229,63 +204,153 @@ final class NoiseEncryptionService {
     
     init(keychain: KeychainManagerProtocol) {
         self.keychain = keychain
-        
-        // Load or create static identity key (ONLY from keychain)
+        self.localPrekeys = LocalPrekeyStore(keychain: keychain)
+
+        // BCH-01-009: Load or create static identity key with proper error handling
         let loadedKey: Curve25519.KeyAgreement.PrivateKey
-        
-        // Try to load from keychain
-        if let identityData = keychain.getIdentityKey(forKey: "noiseStaticKey"),
-           let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: identityData) {
-            loadedKey = key
-            SecureLogger.logKeyOperation(.load, keyType: "noiseStaticKey", success: true)
-        }
-        // If no identity exists, create new one
-        else {
+
+        // Try to load from keychain with proper error classification
+        let noiseKeyResult = keychain.getIdentityKeyWithResult(forKey: "noiseStaticKey")
+
+        switch noiseKeyResult {
+        case .success(let identityData):
+            if let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: identityData) {
+                loadedKey = key
+                SecureLogger.logKeyOperation(.load, keyType: "noiseStaticKey", success: true)
+            } else {
+                // Data corrupted, regenerate
+                SecureLogger.warning("Noise static key data corrupted, regenerating", category: .keychain)
+                loadedKey = Self.generateAndSaveNoiseKey(keychain: keychain)
+            }
+
+        case .itemNotFound:
+            // Expected case: no key exists yet, create new one
+            loadedKey = Self.generateAndSaveNoiseKey(keychain: keychain)
+
+        case .accessDenied:
+            // Critical error - log but proceed with ephemeral key (will be lost on restart)
+            SecureLogger.error(NSError(domain: "Keychain", code: -1),
+                               context: "Keychain access denied - using ephemeral identity", category: .keychain)
             loadedKey = Curve25519.KeyAgreement.PrivateKey()
-            let keyData = loadedKey.rawRepresentation
-            
-            // Save to keychain
-            let saved = keychain.saveIdentityKey(keyData, forKey: "noiseStaticKey")
-            SecureLogger.logKeyOperation(.create, keyType: "noiseStaticKey", success: saved)
+
+        case .deviceLocked, .authenticationFailed:
+            // Recoverable error - use ephemeral key and warn
+            SecureLogger.warning("Device locked or auth failed - using ephemeral identity until unlocked", category: .keychain)
+            loadedKey = Curve25519.KeyAgreement.PrivateKey()
+
+        case .otherError(let status):
+            // Unexpected error - log and use ephemeral key
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)),
+                               context: "Unexpected keychain error - using ephemeral identity", category: .keychain)
+            loadedKey = Curve25519.KeyAgreement.PrivateKey()
         }
-        
+
         // Now assign the final value
         self.staticIdentityKey = loadedKey
         self.staticIdentityPublicKey = staticIdentityKey.publicKey
-        
-        // Load or create signing key pair
+
+        // BCH-01-009: Load or create signing key pair with proper error handling
         let loadedSigningKey: Curve25519.Signing.PrivateKey
-        
-        // Try to load from keychain
-        if let signingData = keychain.getIdentityKey(forKey: "ed25519SigningKey"),
-           let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: signingData) {
-            loadedSigningKey = key
-            SecureLogger.logKeyOperation(.load, keyType: "ed25519SigningKey", success: true)
-        }
-        // If no signing key exists, create new one
-        else {
+
+        let signingKeyResult = keychain.getIdentityKeyWithResult(forKey: "ed25519SigningKey")
+
+        switch signingKeyResult {
+        case .success(let signingData):
+            if let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: signingData) {
+                loadedSigningKey = key
+                SecureLogger.logKeyOperation(.load, keyType: "ed25519SigningKey", success: true)
+            } else {
+                // Data corrupted, regenerate
+                SecureLogger.warning("Ed25519 signing key data corrupted, regenerating", category: .keychain)
+                loadedSigningKey = Self.generateAndSaveSigningKey(keychain: keychain)
+            }
+
+        case .itemNotFound:
+            // Expected case: no key exists yet, create new one
+            loadedSigningKey = Self.generateAndSaveSigningKey(keychain: keychain)
+
+        case .accessDenied:
+            // Critical error - log but proceed with ephemeral key
+            SecureLogger.error(NSError(domain: "Keychain", code: -1),
+                               context: "Keychain access denied - using ephemeral signing key", category: .keychain)
             loadedSigningKey = Curve25519.Signing.PrivateKey()
-            let keyData = loadedSigningKey.rawRepresentation
-            
-            // Save to keychain
-            let saved = keychain.saveIdentityKey(keyData, forKey: "ed25519SigningKey")
-            SecureLogger.logKeyOperation(.create, keyType: "ed25519SigningKey", success: saved)
+
+        case .deviceLocked, .authenticationFailed:
+            // Recoverable error - use ephemeral key and warn
+            SecureLogger.warning("Device locked or auth failed - using ephemeral signing key until unlocked", category: .keychain)
+            loadedSigningKey = Curve25519.Signing.PrivateKey()
+
+        case .otherError(let status):
+            // Unexpected error - log and use ephemeral key
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)),
+                               context: "Unexpected keychain error - using ephemeral signing key", category: .keychain)
+            loadedSigningKey = Curve25519.Signing.PrivateKey()
         }
-        
+
         // Now assign the signing keys
         self.signingKey = loadedSigningKey
         self.signingPublicKey = signingKey.publicKey
-        
+
         // Initialize session manager
         self.sessionManager = NoiseSessionManager(localStaticKey: staticIdentityKey, keychain: keychain)
-        
+
         // Set up session callbacks
         sessionManager.onSessionEstablished = { [weak self] peerID, remoteStaticKey in
             self?.handleSessionEstablished(peerID: peerID, remoteStaticKey: remoteStaticKey)
         }
-        
+
         // Start session maintenance timer
         startRekeyTimer()
+    }
+
+    // MARK: - BCH-01-009: Key Generation Helpers with Save Verification
+
+    /// Generate and save a new Noise static key, verifying the save succeeds
+    private static func generateAndSaveNoiseKey(keychain: KeychainManagerProtocol) -> Curve25519.KeyAgreement.PrivateKey {
+        let newKey = Curve25519.KeyAgreement.PrivateKey()
+        let keyData = newKey.rawRepresentation
+
+        // Save to keychain and verify success
+        let saveResult = keychain.saveIdentityKeyWithResult(keyData, forKey: "noiseStaticKey")
+
+        switch saveResult {
+        case .success:
+            SecureLogger.logKeyOperation(.create, keyType: "noiseStaticKey", success: true)
+        case .duplicateItem:
+            // This shouldn't happen since we just tried to load, but handle it
+            SecureLogger.warning("Noise key already exists (race condition?)", category: .keychain)
+        default:
+            // Save failed - log but continue with the key (it will be ephemeral)
+            SecureLogger.error(NSError(domain: "Keychain", code: -1),
+                               context: "Failed to persist noise static key - identity will be lost on restart",
+                               category: .keychain)
+        }
+
+        return newKey
+    }
+
+    /// Generate and save a new Ed25519 signing key, verifying the save succeeds
+    private static func generateAndSaveSigningKey(keychain: KeychainManagerProtocol) -> Curve25519.Signing.PrivateKey {
+        let newKey = Curve25519.Signing.PrivateKey()
+        let keyData = newKey.rawRepresentation
+
+        // Save to keychain and verify success
+        let saveResult = keychain.saveIdentityKeyWithResult(keyData, forKey: "ed25519SigningKey")
+
+        switch saveResult {
+        case .success:
+            SecureLogger.logKeyOperation(.create, keyType: "ed25519SigningKey", success: true)
+        case .duplicateItem:
+            // This shouldn't happen since we just tried to load, but handle it
+            SecureLogger.warning("Signing key already exists (race condition?)", category: .keychain)
+        default:
+            // Save failed - log but continue with the key (it will be ephemeral)
+            SecureLogger.error(NSError(domain: "Keychain", code: -1),
+                               context: "Failed to persist signing key - identity will be lost on restart",
+                               category: .keychain)
+        }
+
+        return newKey
     }
     
     // MARK: - Public Interface
@@ -302,21 +367,161 @@ final class NoiseEncryptionService {
     
     /// Get our identity fingerprint
     func getIdentityFingerprint() -> String {
-        let hash = SHA256.hash(data: staticIdentityPublicKey.rawRepresentation)
-        return hash.map { String(format: "%02x", $0) }.joined()
+        staticIdentityPublicKey.rawRepresentation.sha256Fingerprint()
     }
     
     /// Get peer's public key data
-    func getPeerPublicKeyData(_ peerID: String) -> Data? {
+    func getPeerPublicKeyData(_ peerID: PeerID) -> Data? {
         return sessionManager.getRemoteStaticKey(for: peerID)?.rawRepresentation
     }
-    
+
+    // MARK: - Courier Envelopes (one-way Noise X)
+
+    /// Domain separation for courier envelopes so X-pattern transcripts can
+    /// never be confused with interactive XX handshakes.
+    private static let courierPrologue = Data("bitchat-courier-v1".utf8)
+
+    /// Encrypt a payload to a peer's known static key without an interactive
+    /// handshake (Noise X pattern). Used for store-and-forward envelopes
+    /// carried by couriers while the recipient is offline.
+    /// - Warning: One-way messages have no forward secrecy: a later compromise
+    ///   of the recipient's static key exposes envelopes captured in transit.
+    ///   Use established sessions whenever the peer is reachable.
+    func sealCourierPayload(_ payload: Data, recipientStaticKey: Data) throws -> Data {
+        let remoteKey = try NoiseHandshakeState.validatePublicKey(recipientStaticKey)
+        let handshake = NoiseHandshakeState(
+            role: .initiator,
+            pattern: .X,
+            keychain: keychain,
+            localStaticKey: staticIdentityKey,
+            remoteStaticKey: remoteKey,
+            prologue: Self.courierPrologue
+        )
+        return try handshake.writeMessage(payload: payload)
+    }
+
+    /// Decrypt a courier envelope addressed to our static key. Returns the
+    /// payload and the sender's authenticated static public key (the `ss`
+    /// DH in the X pattern binds the sender's identity to the ciphertext).
+    func openCourierPayload(_ envelopeCiphertext: Data) throws -> (payload: Data, senderStaticKey: Data) {
+        let handshake = NoiseHandshakeState(
+            role: .responder,
+            pattern: .X,
+            keychain: keychain,
+            localStaticKey: staticIdentityKey,
+            prologue: Self.courierPrologue
+        )
+        let payload = try handshake.readMessage(envelopeCiphertext)
+        guard let senderKey = handshake.getRemoteStaticPublicKey() else {
+            throw NoiseError.missingKeys
+        }
+        return (payload: payload, senderStaticKey: senderKey.rawRepresentation)
+    }
+
+    // MARK: - One-Time Prekey Envelopes (forward-secret Noise X)
+
+    /// Domain separation for prekey-sealed envelopes: distinct from both the
+    /// interactive XX transcripts and static-sealed courier envelopes, and
+    /// bound to the specific prekey ID so a ciphertext cannot be replayed
+    /// against a different prekey.
+    private static let prekeyProloguePrefix = Data("bitchat-prekey-v1".utf8)
+
+    private static func prekeyPrologue(for prekeyID: UInt32) -> Data {
+        var prologue = prekeyProloguePrefix
+        var big = prekeyID.bigEndian
+        withUnsafeBytes(of: &big) { prologue.append(contentsOf: $0) }
+        return prologue
+    }
+
+    /// Encrypt a payload to one of the recipient's gossiped one-time prekeys
+    /// (Noise X where the responder static is the prekey, not the identity
+    /// key). Unlike `sealCourierPayload`, this is forward secret: once the
+    /// recipient consumes the prekey and its grace window lapses, the private
+    /// key is deleted and captured ciphertext becomes undecryptable even if
+    /// the recipient's identity key is later compromised. The initiator's
+    /// static still rides inside (encrypted), so the recipient authenticates
+    /// the sender exactly as with static-sealed envelopes.
+    func sealPrekeyPayload(_ payload: Data, recipientPrekey: PrekeyBundle.Prekey) throws -> Data {
+        let remoteKey = try NoiseHandshakeState.validatePublicKey(recipientPrekey.publicKey)
+        let handshake = NoiseHandshakeState(
+            role: .initiator,
+            pattern: .X,
+            keychain: keychain,
+            localStaticKey: staticIdentityKey,
+            remoteStaticKey: remoteKey,
+            prologue: Self.prekeyPrologue(for: recipientPrekey.id)
+        )
+        return try handshake.writeMessage(payload: payload)
+    }
+
+    /// Decrypt an envelope sealed to one of our one-time prekeys. On success
+    /// the prekey is marked consumed (its private key survives a 48h grace
+    /// window for spray-and-wait redeliveries, then is deleted for good).
+    /// Returns the payload, the sender's authenticated static key (same
+    /// contract as `openCourierPayload`), and whether this open actually
+    /// retired the prekey — false for a redelivery of already-consumed mail —
+    /// so the caller can re-gossip the shrunken bundle only when it changed.
+    func openPrekeyPayload(_ envelopeCiphertext: Data, prekeyID: UInt32) throws -> (payload: Data, senderStaticKey: Data, consumedPrekey: Bool) {
+        guard let prekeyPrivate = localPrekeys.privateKey(for: prekeyID) else {
+            throw NoiseEncryptionError.unknownPrekey
+        }
+        let handshake = NoiseHandshakeState(
+            role: .responder,
+            pattern: .X,
+            keychain: keychain,
+            localStaticKey: prekeyPrivate,
+            prologue: Self.prekeyPrologue(for: prekeyID)
+        )
+        let payload = try handshake.readMessage(envelopeCiphertext)
+        guard let senderKey = handshake.getRemoteStaticPublicKey() else {
+            throw NoiseError.missingKeys
+        }
+        let consumedPrekey = localPrekeys.markConsumed(prekeyID)
+        return (payload: payload, senderStaticKey: senderKey.rawRepresentation, consumedPrekey: consumedPrekey)
+    }
+
+    /// Current signed prekey bundle for gossip, minting the initial batch on
+    /// first use. Nil only when signing fails.
+    func currentPrekeyBundle() -> PrekeyBundle? {
+        let (prekeys, generatedAt) = localPrekeys.currentBundlePrekeys()
+        guard !prekeys.isEmpty else { return nil }
+        let unsigned = PrekeyBundle(
+            noiseStaticPublicKey: getStaticPublicKeyData(),
+            prekeys: prekeys,
+            generatedAt: generatedAt,
+            signature: Data(count: PrekeyBundle.signatureLength)
+        )
+        guard let signature = signData(unsigned.signableBytes()) else { return nil }
+        return PrekeyBundle(
+            noiseStaticPublicKey: unsigned.noiseStaticPublicKey,
+            prekeys: prekeys,
+            generatedAt: generatedAt,
+            signature: signature
+        )
+    }
+
+    /// Verify a peer's bundle signature against their announce-bound Ed25519
+    /// signing key.
+    func verifyPrekeyBundleSignature(_ bundle: PrekeyBundle, signingPublicKey: Data) -> Bool {
+        verifySignature(bundle.signature, for: bundle.signableBytes(), publicKey: signingPublicKey)
+    }
+
+    /// Prune dead prekeys and top the batch back up when consumption runs it
+    /// low. Returns true when the published bundle changed and should be
+    /// re-gossiped.
+    @discardableResult
+    func replenishPrekeysIfNeeded() -> Bool {
+        localPrekeys.replenishIfNeeded()
+    }
+
     /// Clear persistent identity (for panic mode)
     func clearPersistentIdentity() {
         // Clear from keychain
         let deletedStatic = keychain.deleteIdentityKey(forKey: "noiseStaticKey")
         let deletedSigning = keychain.deleteIdentityKey(forKey: "ed25519SigningKey")
         SecureLogger.logKeyOperation(.delete, keyType: "identity keys", success: deletedStatic && deletedSigning)
+        // One-time prekey privates go with the identity they were bound to.
+        localPrekeys.wipe()
         SecureLogger.warning("Panic mode activated - identity cleared", category: .security)
         // Stop rekey timer
         stopRekeyTimer()
@@ -369,7 +574,7 @@ final class NoiseEncryptionService {
     private func canonicalAnnounceBytes(peerID: Data, noiseKey: Data, ed25519Key: Data, nickname: String, timestampMs: UInt64) -> Data {
         var out = Data()
         // context
-        let context = "bitchat-announce-v1".data(using: .utf8) ?? Data()
+        let context = Data("bitchat-announce-v1".utf8)
         out.append(UInt8(min(context.count, 255)))
         out.append(context.prefix(255))
         // peerID (expect 8 bytes; pad/truncate to 8 for canonicalization)
@@ -385,7 +590,7 @@ final class NoiseEncryptionService {
         out.append(ed32)
         if ed32.count < 32 { out.append(Data(repeating: 0, count: 32 - ed32.count)) }
         // nickname length + bytes
-        let nickData = nickname.data(using: .utf8) ?? Data()
+        let nickData = Data(nickname.utf8)
         out.append(UInt8(min(nickData.count, 255)))
         out.append(nickData.prefix(255))
         // timestamp
@@ -435,11 +640,11 @@ final class NoiseEncryptionService {
     // MARK: - Handshake Management
     
     /// Initiate a Noise handshake with a peer
-    func initiateHandshake(with peerID: String) throws -> Data {
+    func initiateHandshake(with peerID: PeerID) throws -> Data {
         
         // Validate peer ID
-        guard NoiseSecurityValidator.validatePeerID(peerID) else {
-            SecureLogger.warning(.authenticationFailed(peerID: peerID))
+        guard peerID.isValid else {
+            SecureLogger.warning(.authenticationFailed(peerID: peerID.id))
             throw NoiseSecurityError.invalidPeerID
         }
         
@@ -449,7 +654,7 @@ final class NoiseEncryptionService {
             throw NoiseSecurityError.rateLimitExceeded
         }
         
-        SecureLogger.info(.handshakeStarted(peerID: peerID))
+        SecureLogger.info(.handshakeStarted(peerID: peerID.id))
         
         // Return raw handshake data without wrapper
         // The Noise protocol handles its own message format
@@ -458,17 +663,17 @@ final class NoiseEncryptionService {
     }
     
     /// Process an incoming handshake message
-    func processHandshakeMessage(from peerID: String, message: Data) throws -> Data? {
+    func processHandshakeMessage(from peerID: PeerID, message: Data) throws -> Data? {
         
         // Validate peer ID
-        guard NoiseSecurityValidator.validatePeerID(peerID) else {
-            SecureLogger.warning(.authenticationFailed(peerID: peerID))
+        guard peerID.isValid else {
+            SecureLogger.warning(.authenticationFailed(peerID: peerID.id))
             throw NoiseSecurityError.invalidPeerID
         }
         
         // Validate message size
         guard NoiseSecurityValidator.validateHandshakeMessageSize(message) else {
-            SecureLogger.warning(.handshakeFailed(peerID: peerID, error: "Message too large"))
+            SecureLogger.warning(.handshakeFailed(peerID: peerID.id, error: "Message too large"))
             throw NoiseSecurityError.messageTooLarge
         }
         
@@ -488,19 +693,19 @@ final class NoiseEncryptionService {
     }
     
     /// Check if we have an established session with a peer
-    func hasEstablishedSession(with peerID: String) -> Bool {
+    func hasEstablishedSession(with peerID: PeerID) -> Bool {
         return sessionManager.getSession(for: peerID)?.isEstablished() ?? false
     }
     
     /// Check if we have a session (established or handshaking) with a peer
-    func hasSession(with peerID: String) -> Bool {
+    func hasSession(with peerID: PeerID) -> Bool {
         return sessionManager.getSession(for: peerID) != nil
     }
     
     // MARK: - Encryption/Decryption
     
     /// Encrypt data for a specific peer
-    func encrypt(_ data: Data, for peerID: String) throws -> Data {
+    func encrypt(_ data: Data, for peerID: PeerID) throws -> Data {
         // Validate message size
         guard NoiseSecurityValidator.validateMessageSize(data) else {
             throw NoiseSecurityError.messageTooLarge
@@ -522,7 +727,7 @@ final class NoiseEncryptionService {
     }
     
     /// Decrypt data from a specific peer
-    func decrypt(_ data: Data, from peerID: String) throws -> Data {
+    func decrypt(_ data: Data, from peerID: PeerID) throws -> Data {
         // Validate message size
         guard NoiseSecurityValidator.validateMessageSize(data) else {
             throw NoiseSecurityError.messageTooLarge
@@ -544,31 +749,10 @@ final class NoiseEncryptionService {
     // MARK: - Peer Management
     
     /// Get fingerprint for a peer
-    func getPeerFingerprint(_ peerID: String) -> String? {
+    func getPeerFingerprint(_ peerID: PeerID) -> String? {
         return serviceQueue.sync {
             return peerFingerprints[peerID]
         }
-    }
-    
-    /// Get peer ID for a fingerprint
-    func getPeerID(for fingerprint: String) -> String? {
-        return serviceQueue.sync {
-            return fingerprintToPeerID[fingerprint]
-        }
-    }
-    
-    /// Remove a peer session
-    func removePeer(_ peerID: String) {
-        sessionManager.removeSession(for: peerID)
-        
-        serviceQueue.sync(flags: .barrier) {
-            if let fingerprint = peerFingerprints[peerID] {
-                fingerprintToPeerID.removeValue(forKey: fingerprint)
-            }
-            peerFingerprints.removeValue(forKey: peerID)
-        }
-        
-        SecureLogger.info(.sessionExpired(peerID: peerID))
     }
 
     func clearEphemeralStateForPanic() {
@@ -579,12 +763,23 @@ final class NoiseEncryptionService {
         }
         rateLimiter.resetAll()
     }
+
+    /// Clear session for a specific peer (e.g., on decryption failure to allow re-handshake)
+    func clearSession(for peerID: PeerID) {
+        sessionManager.removeSession(for: peerID)
+        serviceQueue.sync(flags: .barrier) {
+            if let fingerprint = peerFingerprints.removeValue(forKey: peerID) {
+                fingerprintToPeerID.removeValue(forKey: fingerprint)
+            }
+        }
+        SecureLogger.debug("🔓 Cleared Noise session for \(peerID)", category: .session)
+    }
     
     // MARK: - Private Helpers
     
-    private func handleSessionEstablished(peerID: String, remoteStaticKey: Curve25519.KeyAgreement.PublicKey) {
+    private func handleSessionEstablished(peerID: PeerID, remoteStaticKey: Curve25519.KeyAgreement.PublicKey) {
         // Calculate fingerprint
-        let fingerprint = calculateFingerprint(for: remoteStaticKey)
+        let fingerprint = remoteStaticKey.rawRepresentation.sha256Fingerprint()
         
         // Store fingerprint mapping
         serviceQueue.sync(flags: .barrier) {
@@ -593,7 +788,7 @@ final class NoiseEncryptionService {
         }
         
         // Log security event
-        SecureLogger.info(.handshakeCompleted(peerID: peerID))
+        SecureLogger.info(.handshakeCompleted(peerID: peerID.id))
         
         // Notify all handlers about authentication
         serviceQueue.async { [weak self] in
@@ -601,11 +796,6 @@ final class NoiseEncryptionService {
                 handler(peerID, fingerprint)
             }
         }
-    }
-    
-    private func calculateFingerprint(for publicKey: Curve25519.KeyAgreement.PublicKey) -> String {
-        let hash = SHA256.hash(data: publicKey.rawRepresentation)
-        return hash.map { String(format: "%02x", $0) }.joined()
     }
         
     // MARK: - Session Maintenance
@@ -725,4 +915,7 @@ struct NoiseMessage: Codable {
 enum NoiseEncryptionError: Error {
     case handshakeRequired
     case sessionNotEstablished
+    /// Envelope references a prekey ID we don't hold (never ours, already
+    /// deleted after its grace window, or wiped in a panic).
+    case unknownPrekey
 }

@@ -8,9 +8,7 @@ plans/
 ## AI
 CLAUDE.md
 AGENTS.md
-
-## User settings
-xcuserdata/
+.claude/
 
 ## compatibility with Xcode 8 and earlier (ignoring not required starting Xcode 9)
 *.xcscmblueprint
@@ -57,7 +55,8 @@ iOSInjectionProject/
 
 ## Xcode project
 *.xcodeproj/project.xcworkspace/
-*.xcodeproj/xcshareddata/
+## Xcode User settings
+xcuserdata/
 
 ## Python
 __pycache__/
@@ -67,6 +66,9 @@ __pycache__/
 ## Temporary files
 *.tmp
 *.temp
+
+## Cache
+.cache/
 
 # Local build results
 .Result*/

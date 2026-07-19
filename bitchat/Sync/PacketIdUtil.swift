@@ -1,3 +1,4 @@
+import struct BitFoundation.BitchatPacket
 import Foundation
 import CryptoKit
 
@@ -13,9 +14,5 @@ enum PacketIdUtil {
         hasher.update(data: packet.payload)
         let digest = hasher.finalize()
         return Data(digest.prefix(16))
-    }
-
-    static func computeIdHex(_ packet: BitchatPacket) -> String {
-        return computeId(packet).hexEncodedString()
     }
 }

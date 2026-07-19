@@ -18,23 +18,23 @@ enum GeohashChannelLevel: CaseIterable, Codable, Equatable {
         case .city: return 5
         case .province: return 4
         case .region: return 2
-    }
+        }
     }
 
     var displayName: String {
         switch self {
         case .building:
-            return L10n.string("location_levels.building", comment: "Name for building-level location channel")
+            return String(localized: "location_levels.building", comment: "Name for building-level location channel")
         case .block:
-            return L10n.string("location_levels.block", comment: "Name for block-level location channel")
+            return String(localized: "location_levels.block", comment: "Name for block-level location channel")
         case .neighborhood:
-            return L10n.string("location_levels.neighborhood", comment: "Name for neighborhood-level location channel")
+            return String(localized: "location_levels.neighborhood", comment: "Name for neighborhood-level location channel")
         case .city:
-            return L10n.string("location_levels.city", comment: "Name for city-level location channel")
+            return String(localized: "location_levels.city", comment: "Name for city-level location channel")
         case .province:
-            return L10n.string("location_levels.province", comment: "Name for province-level location channel")
+            return String(localized: "location_levels.province", comment: "Name for province-level location channel")
         case .region:
-            return L10n.string("location_levels.region", comment: "Name for region-level location channel")
+            return String(localized: "location_levels.region", comment: "Name for region-level location channel")
         }
     }
 }
@@ -114,6 +114,20 @@ enum ChannelID: Equatable, Codable {
         switch self {
         case .mesh: return nil
         case .location(let ch): return ch.geohash
+        }
+    }
+    
+    var isMesh: Bool {
+        switch self {
+        case .mesh:     true
+        case .location: false
+        }
+    }
+    
+    var isLocation: Bool {
+        switch self {
+        case .mesh:     false
+        case .location: true
         }
     }
 }
